@@ -1,0 +1,24 @@
+# editor and IDE paraphernalia
+.idea
+*.swp
+*.swo
+*~
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Build artifacts
+build/tools
