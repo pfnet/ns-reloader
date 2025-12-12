@@ -7,8 +7,8 @@ help: ## Display this help.
 
 ##@ Development
 
-.PHONY: check
-check: fmt vet lint test
+.PHONY: all
+all: test build
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.
@@ -19,11 +19,11 @@ vet: ## Run go vet against code.
 	go vet ./...
 
 .PHONY: test
-test: envtest ## Run tests.
+test: envtest lint ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -race ./...
 
 .PHONY: lint
-lint: golangci-lint ## Run golangci-lint linter.
+lint: fmt vet ## Run golangci-lint linter.
 	$(GOLANGCI_LINT) run
 
 ##@ Container Image
@@ -46,22 +46,16 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 ## Tool Binaries
-GOLANGCI_LINT = $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+GOLANGCI_LINT = golangci-lint
 ENVTEST ?= $(LOCALBIN)/envtest
 
 ## Tool Versions
-GOLANGCI_LINT_VERSION ?= v2.7.2
 ENVTEST_K8S_VERSION ?= 1.34.0
 
 .PHONY: envtest
 envtest: $(ENVTEST) ## Download envtest locally.
 $(ENVTEST): $(LOCALBIN)
 	$(call go-install-tool,setup-envtest,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,latest)
-
-.PHONY: golangci-lint
-golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally.
-$(GOLANGCI_LINT): $(LOCALBIN)
-	$(call go-install-tool,golangci-lint,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,${GOLANGCI_LINT_VERSION})
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - tool name
