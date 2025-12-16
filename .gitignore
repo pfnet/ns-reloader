@@ -21,4 +21,4 @@ coverage.*
 profile.cov
 
 # Build artifacts
-build/tools
+build/
