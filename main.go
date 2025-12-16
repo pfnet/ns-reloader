@@ -1,12 +1,29 @@
+// Copyright 2025 Preferred Networks, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 	"time"
 
+	"github.com/go-logr/logr"
 	"go.uber.org/zap/zapcore"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 )
 
@@ -17,16 +34,59 @@ var (
 )
 
 const (
-	// EnvKey_WatchNamespaceSelector is the environment variable key to
-	// specify the label selector for namespaces to watch by reloader.
-	EnvKey_WatchNamespaceSelector = "RELOADER_NAMESPACE_SELECTOR"
-	// EnvKey_TargetEnvKey specifies the key name of the environment variable
-	// where the list of watched namespaces will be set for the wrapped process.
-	EnvKey_TargetEnvKey = "RELOADER_TARGET_ENV_KEY"
+	// envKeyWatchNamespaceSelector is the environment variable
+	// specifying the label selector for namespaces to watch by reloader.
+	envKeyWatchNamespaceSelector = "RELOADER_NAMESPACE_SELECTOR"
 
-	processTerminationGracePeriod = 5 * time.Second
-	processDebouncePeriod         = 5 * time.Second
+	// envKeyTargetEnvKey is the environment variable where the list of
+	// watched namespaces will be set for the wrapped process.
+	envKeyTargetEnvKey = "RELOADER_TARGET_ENV_KEY"
+
+	// envKeyTerminationGracePeriod is the environment variable
+	// specifying the termination grace period for the wrapped process.
+	envKeyTerminationGracePeriod = "RELOADER_TERMINATION_GRACE_PERIOD"
+
+	// envKeyDebouncePeriod is the environment variable specifying the
+	// debounce period for handling namespace changes.
+	envKeyDebouncePeriod = "RELOADER_DEBOUNCE_PERIOD"
 )
+
+const (
+	// defaultTargetEnvVar is the default environment variable name
+	// to set the list of watched namespaces for the wrapped process.
+	defaultTargetEnvVar = "WATCH_NAMESPACES"
+
+	// defaultTerminationGracePeriod is the default grace period for terminating
+	// the wrapped process. It is the time between sending the termination
+	// signal and forcefully killing the process.
+	defaultTerminationGracePeriod = 5 * time.Second
+
+	// defaultDebouncePeriod is the default debounce period for handling
+	// namespace changes. It is the time to wait after a change before
+	// restarting the wrapped process.
+	defaultDebouncePeriod = 5 * time.Second
+)
+
+func getEnvDefault(key, defaultVal string) string {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultVal
+	}
+	return val
+}
+
+func getEnvDuration(log logr.Logger, key string, defaultVal time.Duration) time.Duration {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return defaultVal
+	}
+	val, err := time.ParseDuration(valStr)
+	if err != nil {
+		log.Info("Failed to parse duration from env; using default", "key", key, "value", valStr)
+		val = defaultVal
+	}
+	return val
+}
 
 func main() {
 	log := zap.New(zap.UseFlagOptions(&zap.Options{
@@ -34,27 +94,92 @@ func main() {
 		TimeEncoder: zapcore.RFC3339TimeEncoder,
 		Level:       zapcore.InfoLevel,
 	})).WithName("reloader")
-	ctrl.SetLogger(log)
-	log.Info("Starting ns-reloader", "version", version, "commit", commit)
 
-	// Find the separator "--" to split reloader flags from wrapped command
-	var cmds []string
-	for i, arg := range os.Args {
-		if arg == "--" {
-			if i+1 >= len(os.Args) {
-				log.Error(fmt.Errorf("no command specified after --"), "Usage: reloader [flags] -- <command> [args...]")
-				os.Exit(1)
-			}
-			cmds = os.Args[i+1:]
-			break
-		}
-	}
-	if len(cmds) == 0 {
-		log.Error(fmt.Errorf("missing -- separator"), "Usage: reloader [flags] -- <command> [args...]")
+	flagSet := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	namespaceSelector := flagSet.String(
+		"namespace-selector",
+		getEnvDefault(envKeyWatchNamespaceSelector, ""),
+		"Label selector for namespaces to watch",
+	)
+	targetEnvName := flagSet.String(
+		"target-envvar",
+		getEnvDefault(envKeyTargetEnvKey, defaultTargetEnvVar),
+		"Environment variable name to set the list of watched namespaces for the command",
+	)
+	terminationGracePeriod := flagSet.Duration(
+		"termination-grace-period",
+		getEnvDuration(log, envKeyTerminationGracePeriod, defaultTerminationGracePeriod),
+		"Grace period for terminating the wrapped process",
+	)
+	debouncePeriod := flagSet.Duration(
+		"debounce-period",
+		getEnvDuration(log, envKeyDebouncePeriod, defaultDebouncePeriod),
+		"Debounce period for handling namespace changes",
+	)
+	// kubeconfig path flag for out-of-cluster configuration.
+	// NOTE: This is read by
+	//       [sigs.k8s.io/controller-runtime/pkg/client/config.GetConfig] so we
+	//       don't use it directly.
+	_ = flagSet.String(
+		config.KubeconfigFlagName,
+		"",
+		"Path to the kubeconfig file to use",
+	)
+	config.RegisterFlags(flagSet)
+
+	if err := flagSet.Parse(os.Args[1:]); err != nil {
+		log.Error(err, "Failed to parse flags")
+		flagSet.Usage()
 		os.Exit(1)
 	}
 
-	if err := run(ctrl.SetupSignalHandler(), log, cmds, nil); err != nil {
+	args := flagSet.Args()
+
+	if len(args) == 0 {
+		log.Error(nil, "No command specified")
+		flagSet.Usage()
+		os.Exit(1)
+	}
+
+	// Ensure namespace selector is specified. Watching across all namespaces
+	// should typically be done directly by the controller with cluster scope.
+	if *namespaceSelector == "" {
+		log.Error(
+			nil,
+			"Namespace label selector must be specified. "+
+				"If you wish to watch all namespaces, "+
+				fmt.Sprintf("you likely do not want to use %s. ", os.Args[0])+
+				"Instead, configure your controller to watch with cluster scope.",
+		)
+		flagSet.Usage()
+		os.Exit(1)
+	}
+
+	ctrl.SetLogger(log)
+	log.Info("Starting ns-reloader", "version", version, "commit", commit)
+	log.Info("Configuration",
+		"namespaceSelector", *namespaceSelector,
+		"targetEnvVar", *targetEnvName,
+		"terminationGracePeriod", terminationGracePeriod.String(),
+		"debouncePeriod", debouncePeriod.String(),
+		"command", args,
+	)
+
+	kubeConfig, err := config.GetConfig()
+	if err != nil {
+		log.Error(err, "Failed to load kubeconfig")
+	}
+
+	cfg := &ProcessManagerConfig{
+		kubeConfig:             kubeConfig,
+		logger:                 log,
+		arguments:              args,
+		namespaceSelector:      *namespaceSelector,
+		targetEnvVar:           *targetEnvName,
+		terminationGracePeriod: *terminationGracePeriod,
+		debouncePeriod:         *debouncePeriod,
+	}
+	if err := run(ctrl.SetupSignalHandler(), cfg); err != nil {
 		log.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}

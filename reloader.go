@@ -1,3 +1,17 @@
+// Copyright 2025 Preferred Networks, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//	http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
@@ -18,46 +32,31 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-func run(ctx context.Context, log logr.Logger, cmds []string, cfg *rest.Config) error {
-	_, ok := os.LookupEnv(EnvKey_TargetEnvKey)
-	if !ok {
-		return fmt.Errorf("environment variable %s is not set", EnvKey_TargetEnvKey)
-	}
-	nsLbslStr, ok := os.LookupEnv(EnvKey_WatchNamespaceSelector)
-	if !ok {
-		return fmt.Errorf("environment variable %s is not set", EnvKey_WatchNamespaceSelector)
-	}
-
-	if cfg == nil {
-		cfg = config.GetConfigOrDie()
-	}
-	mgr, err := manager.New(cfg, manager.Options{
-		Metrics:                server.Options{BindAddress: "0"},
-		HealthProbeBindAddress: "0", // Disable metrics and health check endpoints. Wapped process should be responsible for them.
+func run(ctx context.Context, cfg *ProcessManagerConfig) error {
+	mgr, err := manager.New(cfg.kubeConfig, manager.Options{
+		Metrics: server.Options{BindAddress: "0"},
+		// Disable metrics and health check endpoints.
+		// Wrapped process should be responsible for them.
+		HealthProbeBindAddress: "0",
 	})
 	if err != nil {
 		return fmt.Errorf("create manager: %w", err)
 	}
 
-	procMgr := &ProcessManager{
-		log:        log,
-		commands:   cmds,
-		updateChan: make(chan struct{}, 1),
-	}
-	if err := mgr.Add(procMgr); err != nil {
-		return fmt.Errorf("failed to add process manager: %w", err)
+	procMgr := NewProcessManager(cfg)
+	if addErr := mgr.Add(procMgr); addErr != nil {
+		return fmt.Errorf("failed to add process manager: %w", addErr)
 	}
 
-	nsLbsl, err := metav1.ParseToLabelSelector(nsLbslStr)
+	nsLbsl, err := metav1.ParseToLabelSelector(cfg.namespaceSelector)
 	if err != nil {
-		return fmt.Errorf("parse label selector from %s: %w", nsLbslStr, err)
+		return fmt.Errorf("parse label selector from %s: %w", cfg.namespaceSelector, err)
 	}
 	nsLblPredicate, err := predicate.LabelSelectorPredicate(*nsLbsl)
 	if err != nil {
@@ -81,23 +80,65 @@ func run(ctx context.Context, log logr.Logger, cmds []string, cfg *rest.Config) 
 	return mgr.Start(ctx)
 }
 
-type ProcessManager struct {
-	log      logr.Logger
-	commands []string
-	cmd      *exec.Cmd
+// ProcessManagerConfig holds the configuration for [ProcessManager].
+type ProcessManagerConfig struct {
+	logger    logr.Logger
+	arguments []string
 
+	kubeConfig *rest.Config
+
+	namespaceSelector string
+	targetEnvVar      string
+
+	terminationGracePeriod time.Duration
+	debouncePeriod         time.Duration
+}
+
+// ProcessManager manages the lifecycle of a wrapped process,
+type ProcessManager struct {
+	log logr.Logger
+
+	targetEnvVar string
+
+	arguments              []string
+	terminationGracePeriod time.Duration
+	debouncePeriod         time.Duration
+
+	cmd             *exec.Cmd
 	watchNamespaces atomic.Value
 	updateChan      chan struct{}
 }
 
-func (pm *ProcessManager) UpdateNamespaces(ns string) {
-	pm.watchNamespaces.Store(ns) // overwrite with the latest status
+// NewProcessManager creates a new [ProcessManager] with the given configuration.
+func NewProcessManager(cfg *ProcessManagerConfig) *ProcessManager {
+	var watchNamespaces atomic.Value
+
+	// NOTE: Initialize with empty string to avoid nil dereference.
+	//       This should still be set by Reconcile before use.
+	watchNamespaces.Store("")
+	return &ProcessManager{
+		arguments:              cfg.arguments,
+		log:                    cfg.logger,
+		targetEnvVar:           cfg.targetEnvVar,
+		watchNamespaces:        watchNamespaces,
+		terminationGracePeriod: cfg.terminationGracePeriod,
+		debouncePeriod:         cfg.debouncePeriod,
+		updateChan:             make(chan struct{}, 1),
+	}
+}
+
+// UpdateNamespaces updates the namespaces to watch and triggers a process
+// restart. This method may be called concurrently.
+func (pm *ProcessManager) UpdateNamespaces(ns []string) {
+	// Update the requested namespaces to watch.
+	pm.watchNamespaces.Store(strings.Join(ns, ","))
 	select {
 	default:
 	case pm.updateChan <- struct{}{}:
 	}
 }
 
+// Start starts the process manager loop.
 func (pm *ProcessManager) Start(ctx context.Context) error {
 	for {
 		select {
@@ -105,13 +146,14 @@ func (pm *ProcessManager) Start(ctx context.Context) error {
 			pm.log.Info("Shutting down process manager")
 			return pm.stopProcess()
 		case <-pm.updateChan:
-			curNS := os.Getenv(EnvKey_TargetEnvKey)
+			curNS := os.Getenv(pm.targetEnvVar)
 			newNS := pm.watchNamespaces.Load().(string)
 			if curNS == newNS {
-				continue // already updated
+				continue // already current.
 			}
-			if err := os.Setenv(EnvKey_TargetEnvKey, newNS); err != nil {
-				return fmt.Errorf("failed to set %s: %w", EnvKey_TargetEnvKey, err)
+			// Update the currently watched namespaces.
+			if err := os.Setenv(pm.targetEnvVar, newNS); err != nil {
+				return fmt.Errorf("failed to set %s: %w", pm.targetEnvVar, err)
 			}
 			if err := pm.stopProcess(); err != nil {
 				return err
@@ -119,25 +161,30 @@ func (pm *ProcessManager) Start(ctx context.Context) error {
 			if err := pm.startProcess(); err != nil {
 				return err
 			}
-			time.Sleep(processDebouncePeriod)
+			time.Sleep(pm.debouncePeriod)
 		}
 	}
 }
 
+// startProcess starts the wrapped process. This method cannot be called
+// concurrently.
 func (pm *ProcessManager) startProcess() error {
 	if pm.cmd != nil {
 		return fmt.Errorf("process is already running, previous termination might not have completed")
 	}
-	pm.cmd = exec.Command(pm.commands[0], pm.commands[1:]...)
+	pm.cmd = exec.Command(pm.arguments[0], pm.arguments[1:]...)
 	pm.cmd.Stdout = os.Stdout
 	pm.cmd.Stderr = os.Stderr
+
 	if err := pm.cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start process: %w", err)
 	}
-	pm.log.Info("Process started", "pid", pm.cmd.Process.Pid, "namespaces", os.Getenv("WATCH_NAMESPACE"))
+	pm.log.Info("Process started", "pid", pm.cmd.Process.Pid, "namespaces", os.Getenv(pm.targetEnvVar))
 	return nil
 }
 
+// stopProcess stops the wrapped process gracefully. This method cannot be
+// called concurrently.
 func (pm *ProcessManager) stopProcess() error {
 	if pm.cmd == nil {
 		return nil // no process is running
@@ -150,7 +197,7 @@ func (pm *ProcessManager) stopProcess() error {
 	go func() { done <- pm.cmd.Wait() }()
 	select {
 	case <-done:
-	case <-time.After(processTerminationGracePeriod):
+	case <-time.After(pm.terminationGracePeriod):
 		pm.log.Info("Process did not stop gracefully, sending SIGKILL", "pid", pid)
 		if err := pm.cmd.Process.Signal(syscall.SIGKILL); err != nil {
 			return fmt.Errorf("failed to send SIGKILL to pid %d: %w", pid, err)
@@ -162,12 +209,14 @@ func (pm *ProcessManager) stopProcess() error {
 	return nil
 }
 
+// NamespaceWatcher watches namespace resources and notifies the ProcessManager
 type NamespaceWatcher struct {
 	client         client.Client
 	nsSelector     labels.Selector
 	processManager *ProcessManager
 }
 
+// Reconcile reconciles the namespace resources.
 func (r *NamespaceWatcher) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	var nslist corev1.NamespaceList
 	if err := r.client.List(ctx, &nslist, &client.ListOptions{
@@ -182,6 +231,6 @@ func (r *NamespaceWatcher) Reconcile(ctx context.Context, request reconcile.Requ
 	}
 	sort.Strings(namespaces)
 
-	r.processManager.UpdateNamespaces(strings.Join(namespaces, ","))
+	r.processManager.UpdateNamespaces(namespaces)
 	return reconcile.Result{}, nil
 }
