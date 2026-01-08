@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -38,7 +39,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-func run(ctx context.Context, cfg *ProcessManagerConfig) error {
+func run(ctx context.Context, controllerName string, cfg *ProcessManagerConfig) error {
 	mgr, err := manager.New(cfg.kubeConfig, manager.Options{
 		Metrics: server.Options{BindAddress: "0"},
 		// Disable metrics and health check endpoints.
@@ -67,6 +68,7 @@ func run(ctx context.Context, cfg *ProcessManagerConfig) error {
 		return fmt.Errorf("convert label selector: %w", err)
 	}
 	if err := builder.ControllerManagedBy(mgr).
+		Named(controllerName).
 		For(&corev1.Namespace{}).
 		WithEventFilter(nsLblPredicate).
 		Complete(&NamespaceWatcher{
@@ -91,6 +93,7 @@ type ProcessManagerConfig struct {
 	targetEnvVar      string
 
 	terminationGracePeriod time.Duration
+	sigkillTimeout         time.Duration
 	debouncePeriod         time.Duration
 }
 
@@ -102,11 +105,27 @@ type ProcessManager struct {
 
 	arguments              []string
 	terminationGracePeriod time.Duration
+	sigkillTimeout         time.Duration
 	debouncePeriod         time.Duration
 
-	cmd             *exec.Cmd
+	// process holds the state of the currently running process. Subfields are
+	// protected by the embedded mutex.
+	process struct {
+		sync.RWMutex
+
+		// cmd is the currently running command (sub-process). It is nil if no
+		// process is running.
+		cmd *exec.Cmd
+
+		// done is closed when the process has exited.
+		done chan struct{}
+	}
+
+	// watchNamespaces holds the currently requested namespaces to watch.
 	watchNamespaces atomic.Value
-	updateChan      chan struct{}
+
+	// updateChan is used to signal that the watched namespaces have changed.
+	updateChan chan struct{}
 }
 
 // NewProcessManager creates a new [ProcessManager] with the given configuration.
@@ -116,41 +135,68 @@ func NewProcessManager(cfg *ProcessManagerConfig) *ProcessManager {
 	// NOTE: Initialize with empty string to avoid nil dereference.
 	//       This should still be set by Reconcile before use.
 	watchNamespaces.Store("")
-	return &ProcessManager{
+
+	pm := &ProcessManager{
 		arguments:              cfg.arguments,
 		log:                    cfg.logger,
 		targetEnvVar:           cfg.targetEnvVar,
 		watchNamespaces:        watchNamespaces,
 		terminationGracePeriod: cfg.terminationGracePeriod,
+		sigkillTimeout:         cfg.sigkillTimeout,
 		debouncePeriod:         cfg.debouncePeriod,
 		updateChan:             make(chan struct{}, 1),
 	}
+
+	// Initialize the process done channel as closed to indicate no process is
+	// running.
+	pm.process.done = make(chan struct{})
+	close(pm.process.done)
+
+	return pm
 }
 
 // UpdateNamespaces updates the namespaces to watch and triggers a process
-// restart. This method may be called concurrently.
+// restart. This method may be called concurrently by Reconcile.
 func (pm *ProcessManager) UpdateNamespaces(ns []string) {
 	// Update the requested namespaces to watch.
-	pm.watchNamespaces.Store(strings.Join(ns, ","))
+	namespaces := strings.Join(ns, ",")
+	pm.watchNamespaces.Store(namespaces)
 	select {
-	default:
 	case pm.updateChan <- struct{}{}:
+	default:
 	}
 }
 
 // Start starts the process manager loop.
 func (pm *ProcessManager) Start(ctx context.Context) error {
+	// Start the wrapped process immediately.
+	debounceTimer := time.NewTimer(0)
+	// Prevent the timer from firing immediately. We need to wait for the
+	// initial set of namespaces to be provided before starting the process.
+	// As of Go 1.23, the C channel will block after Stop is called.
+	debounceTimer.Stop()
+	lastReload := time.Now()
+
 	for {
 		select {
 		case <-ctx.Done():
 			pm.log.Info("Shutting down process manager")
 			return pm.stopProcess()
-		case <-pm.updateChan:
+		case <-debounceTimer.C:
 			curNS := os.Getenv(pm.targetEnvVar)
 			newNS := pm.watchNamespaces.Load().(string)
-			if curNS == newNS {
-				continue // already current.
+
+			select {
+			case <-pm.Done():
+				// Process is not running. Restart is needed.
+			default:
+				// Process is running. If the namespaces are unchanged, do
+				// nothing.
+				if curNS == newNS {
+					continue // already current.
+				}
 			}
+
 			// Update the currently watched namespaces.
 			if err := os.Setenv(pm.targetEnvVar, newNS); err != nil {
 				return fmt.Errorf("failed to set %s: %w", pm.targetEnvVar, err)
@@ -161,51 +207,159 @@ func (pm *ProcessManager) Start(ctx context.Context) error {
 			if err := pm.startProcess(); err != nil {
 				return err
 			}
-			time.Sleep(pm.debouncePeriod)
+
+			lastReload = time.Now()
+		case <-pm.updateChan:
+			var waitPeriod time.Duration
+			select {
+			case <-pm.Done():
+				// Process is not running. Restart immediately.
+				waitPeriod = 0
+			default:
+				// Process is running. Wait for the debounce period to elapse
+				// since the last reload.
+				waitPeriod = max(pm.debouncePeriod-time.Since(lastReload), 0)
+			}
+			if !debounceTimer.Reset(waitPeriod) {
+				// The timer has already triggered. Create a new timer.
+				debounceTimer = time.NewTimer(waitPeriod)
+			}
+			pm.log.Info("Namespace update received; scheduling restart", "waitPeriod", waitPeriod)
 		}
 	}
 }
 
-// startProcess starts the wrapped process. This method cannot be called
-// concurrently.
-func (pm *ProcessManager) startProcess() error {
-	if pm.cmd != nil {
-		return fmt.Errorf("process is already running, previous termination might not have completed")
+// currentPID returns the PID of the currently running process, or 0 if no
+// process is running.
+func (pm *ProcessManager) currentPID() int {
+	pm.process.RLock()
+	defer pm.process.RUnlock()
+	if pm.process.cmd == nil {
+		return 0
 	}
-	pm.cmd = exec.Command(pm.arguments[0], pm.arguments[1:]...)
-	pm.cmd.Stdout = os.Stdout
-	pm.cmd.Stderr = os.Stderr
+	return pm.process.cmd.Process.Pid
+}
 
-	if err := pm.cmd.Start(); err != nil {
+// Done returns a channel that is closed when the wrapped process exits.
+func (pm *ProcessManager) Done() chan struct{} {
+	pm.process.RLock()
+	defer pm.process.RUnlock()
+	return pm.process.done
+}
+
+// startProcess starts the wrapped process and returns immediately.
+func (pm *ProcessManager) startProcess() error {
+	pm.process.Lock()
+	defer pm.process.Unlock()
+
+	// This may occur if startProcess is called concurrently with
+	// `waitForProcess`. This shouldn't happen.
+	if pm.process.cmd != nil {
+		panic(fmt.Sprintf("process %d is already started; this is a bug, please submit an issue at %s", pm.process.cmd.Process.Pid, issuesURL))
+	}
+
+	pm.process.cmd = exec.Command(pm.arguments[0], pm.arguments[1:]...)
+	pm.process.cmd.Stdout = os.Stdout
+	pm.process.cmd.Stderr = os.Stderr
+
+	if err := pm.process.cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start process: %w", err)
 	}
-	pm.log.Info("Process started", "pid", pm.cmd.Process.Pid, "namespaces", os.Getenv(pm.targetEnvVar))
+
+	pm.process.done = make(chan struct{})
+
+	pm.log.Info("Process started", "pid", pm.process.cmd.Process.Pid, "namespaces", os.Getenv(pm.targetEnvVar))
+
+	go pm.waitForProcess(pm.process.cmd, pm.process.done)
+
 	return nil
 }
 
-// stopProcess stops the wrapped process gracefully. This method cannot be
-// called concurrently.
-func (pm *ProcessManager) stopProcess() error {
-	if pm.cmd == nil {
-		return nil // no process is running
+// waitForProcess waits for the wrapped process to exit and cleans up the
+// state accordingly. This method will run concurrently with
+// [ProcessManager.startProcess] and [ProcessManager.stopProcess].
+func (pm *ProcessManager) waitForProcess(cmd *exec.Cmd, done chan struct{}) {
+	pm.log.Info("Waiting for process", "pid", cmd.Process.Pid)
+
+	err := cmd.Wait()
+	if err != nil {
+		pm.log.Error(err, "Process exited with error", "pid", cmd.Process.Pid)
+	} else {
+		pm.log.Info("Process exited", "pid", cmd.Process.Pid)
 	}
-	pid := pm.cmd.Process.Pid
-	if err := pm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("failed to send SIGTERM to pid %d: %w", pid, err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- pm.cmd.Wait() }()
+
+	// The process has terminated. Clean up the cmd resource.
+	pm.process.Lock()
+	pm.process.cmd = nil
+	pm.process.Unlock()
+
+	// Signal that the process has exited.
+	close(done)
+
+	// Request that the process be restarted.
 	select {
-	case <-done:
-	case <-time.After(pm.terminationGracePeriod):
-		pm.log.Info("Process did not stop gracefully, sending SIGKILL", "pid", pid)
-		if err := pm.cmd.Process.Signal(syscall.SIGKILL); err != nil {
-			return fmt.Errorf("failed to send SIGKILL to pid %d: %w", pid, err)
-		}
-		<-done
+	case pm.updateChan <- struct{}{}:
+	default:
 	}
-	pm.log.Info("Process stopped", "pid", pid)
-	pm.cmd = nil
+}
+
+// stopProcess stops the wrapped process gracefully. stopProcess should not be
+// running concurrently with [ProcessManager.startProcess].
+func (pm *ProcessManager) stopProcess() error {
+	select {
+	case <-pm.Done():
+		// Process is already stopped.
+		return nil
+	default:
+	}
+
+	pid := pm.currentPID()
+
+	pm.log.Info("Stopping process", "pid", pid)
+	if err := pm.sendSignal(syscall.SIGTERM); err != nil {
+		return err
+	}
+
+	select {
+	case <-pm.Done():
+		// Process is already stopped.
+		return nil
+	case <-time.After(pm.terminationGracePeriod):
+	}
+
+	pm.log.Info("Process did not stop gracefully, sending SIGKILL", "pid", pid)
+	if err := pm.sendSignal(syscall.SIGKILL); err != nil {
+		return err
+	}
+
+	select {
+	case <-pm.Done():
+		// Process is already stopped.
+		return nil
+	case <-time.After(pm.sigkillTimeout):
+	}
+
+	// The process is not responding to SIGKILL. Completely bail out.
+	return fmt.Errorf("process %d did not respond to SIGKILL after %s", pid, pm.sigkillTimeout)
+}
+
+// sendSignal sends the given signal to terminate the wrapped process. If the
+// process is not running, this is a no-op.
+func (pm *ProcessManager) sendSignal(sig os.Signal) error {
+	pm.process.RLock()
+	defer pm.process.RUnlock()
+	if pm.process.cmd == nil {
+		return nil
+	}
+
+	if err := pm.process.cmd.Process.Signal(sig); err != nil {
+		if processExistsErr := pm.process.cmd.Process.Signal(syscall.Signal(0)); processExistsErr == nil {
+			// The process exists but we failed to send a signal.
+			// Something very wrong has happened.
+			return fmt.Errorf("failed to send %v to pid %d: %w", sig, pm.process.cmd.Process.Pid, err)
+		}
+	}
+
 	return nil
 }
 
