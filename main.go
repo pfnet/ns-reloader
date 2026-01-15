@@ -46,9 +46,17 @@ const (
 	// specifying the termination grace period for the wrapped process.
 	envKeyTerminationGracePeriod = "RELOADER_TERMINATION_GRACE_PERIOD"
 
+	// envKeySigkillTimeout is the environment variable specifying the time to
+	// wait for the process after SIGKILL has been sent before completely
+	// giving up.
+	envKeySigkillTimeout = "RELOADER_SIGKILL_TIMEOUT"
+
 	// envKeyDebouncePeriod is the environment variable specifying the
 	// debounce period for handling namespace changes.
 	envKeyDebouncePeriod = "RELOADER_DEBOUNCE_PERIOD"
+
+	repoURL   = "https://github.com/pfnet/ns-reloader"
+	issuesURL = repoURL + "/issues"
 )
 
 const (
@@ -60,6 +68,10 @@ const (
 	// the wrapped process. It is the time between sending the termination
 	// signal and forcefully killing the process.
 	defaultTerminationGracePeriod = 5 * time.Second
+
+	// defaultSigkillTimeout is the default time to wait for the process after
+	// SIGKILL has been sent before completely giving up.
+	defaultSigkillTimeout = 5 * time.Second
 
 	// defaultDebouncePeriod is the default debounce period for handling
 	// namespace changes. It is the time to wait after a change before
@@ -110,6 +122,11 @@ func main() {
 		"termination-grace-period",
 		getEnvDuration(log, envKeyTerminationGracePeriod, defaultTerminationGracePeriod),
 		"Grace period for terminating the wrapped process",
+	)
+	sigkillTimeout := flagSet.Duration(
+		"sigkill-timeout",
+		getEnvDuration(log, envKeySigkillTimeout, defaultSigkillTimeout),
+		"Timeout to wait after sending SIGKILL before giving up.",
 	)
 	debouncePeriod := flagSet.Duration(
 		"debounce-period",
@@ -177,9 +194,10 @@ func main() {
 		namespaceSelector:      *namespaceSelector,
 		targetEnvVar:           *targetEnvName,
 		terminationGracePeriod: *terminationGracePeriod,
+		sigkillTimeout:         *sigkillTimeout,
 		debouncePeriod:         *debouncePeriod,
 	}
-	if err := run(ctrl.SetupSignalHandler(), cfg); err != nil {
+	if err := run(ctrl.SetupSignalHandler(), "ns-reloader", cfg); err != nil {
 		log.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
