@@ -97,4 +97,4 @@ jobs:
           # release notes before publishing.
           draft: true
           files: |
-            ns-reloader-linux-amd64
+            build/ns-reloader-linux-amd64
