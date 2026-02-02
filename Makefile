@@ -50,7 +50,7 @@ all: test build docker-build ## Run tests and build.
 
 .PHONY: build
 build: ## Build binary.
-	@go build -o build/ns-reloader .
+	@CGO_ENABLED=0 GOOS=linux go build -o build/ns-reloader-$(kernel)-$(arch) .
 
 .PHONY: test
 test: lint unit-test ## Run tests.
