@@ -6,7 +6,7 @@ the following release workflow is used.
 
 ## Update `CHANGELOG.md`
 
-Before the release, ensure that `CHANGELOG.md` is updated with and relevant
+Before the release, ensure that `CHANGELOG.md` is updated with all relevant
 changes for the new version.
 
 ## Create and push a new tag
