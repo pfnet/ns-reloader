@@ -15,9 +15,8 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*.*.*" # Semver tags like v1.2.3
+  release:
+    types: [published]
 
 permissions: {}
 
@@ -70,31 +69,3 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64
-
-  build-binaries:
-    name: Build Release Binaries
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout the repository
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
-        with:
-          go-version-file: "go.mod"
-
-      - name: run tests
-        run: make test
-
-      - name: Build binary
-        run: make build
-
-      - name: Upload binary
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
-        with:
-          # Create a draft release to allow uploading assets and editing of
-          # release notes before publishing.
-          draft: true
-          files: |
-            build/ns-reloader-linux-amd64
