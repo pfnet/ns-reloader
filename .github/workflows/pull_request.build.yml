@@ -38,7 +38,6 @@ jobs:
     name: Build Docker Image
     permissions:
       contents: read # for checking out the repo.
-      packages: write # for pushing the image to the registry.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the repository
