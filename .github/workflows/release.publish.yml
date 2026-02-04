@@ -69,3 +69,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64
+          build-args: |
+            BUILD_VERSION=${{ github.event.release.tag_name }}
+            BUILD_COMMIT=${{ github.sha }}
