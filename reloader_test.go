@@ -119,7 +119,7 @@ func testProcessRestart(t *testing.T, orgName string, cmdArgs []string) {
 	}()
 
 	// Set the initial namespaces to trigger process start.
-	pm.UpdateNamespaces([]string{"initial-namespace"})
+	pm.UpdateNamespaces("initial-namespace")
 
 	// Wait for the initial process to start.
 	var oldPid int
@@ -206,7 +206,7 @@ func testDebounce(t *testing.T, orgName string, cmdArgs []string) {
 
 	// Set the initial namespaces to trigger process start.
 	startingNS := "initial-namespace"
-	pm.UpdateNamespaces([]string{startingNS})
+	pm.UpdateNamespaces(startingNS)
 
 	// Wait for the initial process to start.
 	var oldPid int
@@ -233,7 +233,7 @@ func testDebounce(t *testing.T, orgName string, cmdArgs []string) {
 	go func() {
 		// ~500 millisecond worth of updates
 		for i := range numUpdates {
-			pm.UpdateNamespaces([]string{fmt.Sprintf("namespace-%d", i)})
+			pm.UpdateNamespaces(fmt.Sprintf("namespace-%d", i))
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
@@ -253,6 +253,77 @@ func testDebounce(t *testing.T, orgName string, cmdArgs []string) {
 		}
 		return !failForever && storedWNS == expectedWNS
 	}, 5*time.Second, 500*time.Millisecond, "Timed out waiting for expected namespaces to be set")
+}
+
+func testTrailingDebounce(t *testing.T, orgName string, cmdArgs []string) {
+	pm := NewProcessManager(&ProcessManagerConfig{
+		kubeConfig:        nil,
+		namespaceSelector: fmt.Sprintf("organization/name=%s", orgName),
+		targetEnvVar:      defaultTargetEnvVar,
+
+		arguments:              cmdArgs,
+		terminationGracePeriod: 2 * time.Second,
+		sigkillTimeout:         2 * time.Second,
+		debouncePeriod:         200 * time.Millisecond,
+		logger:                 testr.New(t),
+	})
+
+	pmStop := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() {
+		assert.NoError(t, pm.Start(ctx))
+		close(pmStop)
+	}()
+	defer func() {
+		cancel()
+		<-pmStop
+	}()
+
+	pm.UpdateNamespaces("ns-0")
+	var oldPid int
+	require.Eventually(t, func() bool {
+		select {
+		case <-pm.Done():
+			return false
+		default:
+		}
+		oldPid = pm.currentPID()
+		return oldPid != 0
+	}, 5*time.Second, 50*time.Millisecond, "Timed out waiting initial process to start")
+	assert.Equal(t, oldPid, pm.currentPID(), "process restarted before the quiet period elapsed")
+	assert.Equal(t, "ns-0", os.Getenv(defaultTargetEnvVar), "namespaces changed before the quiet period elapsed")
+
+	var finalNS string
+	for i := range 5 {
+		finalNS = fmt.Sprintf("ns-%d", i+1)
+		pm.UpdateNamespaces(finalNS)
+		time.Sleep(100 * time.Millisecond)
+	}
+	assert.Eventually(t, func() bool {
+		return pm.currentPID() != oldPid && os.Getenv(defaultTargetEnvVar) == finalNS
+	}, 5*time.Second, 50*time.Millisecond, "Timed out waiting for the final debounced restart")
+}
+
+func TestProcessManagerIgnoresDuplicateNamespaceUpdates(t *testing.T) {
+	pm := NewProcessManager(&ProcessManagerConfig{
+		targetEnvVar: defaultTargetEnvVar,
+		logger:       testr.New(t),
+	})
+
+	pm.UpdateNamespaces("ns-a")
+	select {
+	case <-pm.updateChan:
+	default:
+		t.Fatal("expected first namespace update to be queued")
+	}
+
+	pm.UpdateNamespaces("ns-a")
+	select {
+	case <-pm.updateChan:
+		t.Fatal("duplicate namespace update should not be queued")
+	default:
+	}
 }
 
 func TestReloader(t *testing.T) {
@@ -283,5 +354,10 @@ func TestProcessManager(t *testing.T) {
 	t.Run("handles debounce", func(t *testing.T) {
 		args := []string{"sh", "-c", "trap 'exit' TERM; while :; do sleep 1; done"}
 		testDebounce(t, "test-debounce", args)
+	})
+
+	t.Run("uses trailing-edge debounce", func(t *testing.T) {
+		args := []string{"sh", "-c", "trap 'exit' TERM; while :; do sleep 1; done"}
+		testTrailingDebounce(t, "test-trailing-debounce", args)
 	})
 }

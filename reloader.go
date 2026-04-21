@@ -157,10 +157,11 @@ func NewProcessManager(cfg *ProcessManagerConfig) *ProcessManager {
 
 // UpdateNamespaces updates the namespaces to watch and triggers a process
 // restart. This method may be called concurrently by Reconcile.
-func (pm *ProcessManager) UpdateNamespaces(ns []string) {
+func (pm *ProcessManager) UpdateNamespaces(ns string) {
 	// Update the requested namespaces to watch.
-	namespaces := strings.Join(ns, ",")
-	pm.watchNamespaces.Store(namespaces)
+	if pm.watchNamespaces.Swap(ns) == ns {
+		return
+	}
 	select {
 	case pm.updateChan <- struct{}{}:
 	default:
@@ -220,10 +221,13 @@ func (pm *ProcessManager) Start(ctx context.Context) error {
 				// since the last reload.
 				waitPeriod = max(pm.debouncePeriod-time.Since(lastReload), 0)
 			}
-			if !debounceTimer.Reset(waitPeriod) {
-				// The timer has already triggered. Create a new timer.
-				debounceTimer = time.NewTimer(waitPeriod)
+			if !debounceTimer.Stop() {
+				select {
+				case <-debounceTimer.C:
+				default:
+				}
 			}
+			debounceTimer.Reset(waitPeriod)
 			pm.log.Info("Namespace update received; scheduling restart", "waitPeriod", waitPeriod)
 		}
 	}
@@ -385,6 +389,6 @@ func (r *NamespaceWatcher) Reconcile(ctx context.Context, request reconcile.Requ
 	}
 	sort.Strings(namespaces)
 
-	r.processManager.UpdateNamespaces(namespaces)
+	r.processManager.UpdateNamespaces(strings.Join(namespaces, ","))
 	return reconcile.Result{}, nil
 }
