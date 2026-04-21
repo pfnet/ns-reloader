@@ -40,6 +40,7 @@ GCI_VERSION ?= v0.13.7
 # NOTE: Do not include the v prefix for golangci-lint
 GOLANGCI_LINT_VERSION ?= 2.7.2
 GOIMPORTS_VERSION ?= v0.40.0
+SETUP_ENVTEST_VERSION ?= v0.0.0-20260109145143-0c3a9102bc0a
 
 .PHONY: help
 help: ## Display this help.
@@ -138,7 +139,7 @@ $(LOCALBIN):
 .PHONY: envtest-install
 envtest-install: $(ENVTEST_BINARY) ## Download envtest locally.
 $(ENVTEST_BINARY): $(LOCALBIN)
-	$(call go-install-tool,setup-envtest,$(ENVTEST_BINARY),sigs.k8s.io/controller-runtime/tools/setup-envtest,latest)
+	$(call go-install-tool,setup-envtest,$(ENVTEST_BINARY),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(SETUP_ENVTEST_VERSION))
 
 .PHONY: golangci-lint-install
 golangci-lint-install: $(GOLANGCI_LINT_BINARY) ## Download golangci-lint locally.
