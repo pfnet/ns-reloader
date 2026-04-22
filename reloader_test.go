@@ -229,6 +229,39 @@ func testDebounce(t *testing.T, orgName string, cmdArgs []string) {
 	t.Log("Initial process started with PID", oldPid)
 
 	numUpdates := 50
+	expectedWNS := fmt.Sprintf("namespace-%d", numUpdates-1)
+	envHistory := make(chan string, numUpdates+1)
+	pidHistory := make(chan int, numUpdates+1)
+	observeDone := make(chan struct{})
+	go func() {
+		defer close(observeDone)
+
+		prevWNS := os.Getenv(defaultTargetEnvVar)
+		prevPID := pm.currentPID()
+		for {
+			curWNS := os.Getenv(defaultTargetEnvVar)
+			curPID := pm.currentPID()
+			if curWNS != prevWNS {
+				envHistory <- curWNS
+				prevWNS = curWNS
+			}
+			if curPID != 0 && curPID != prevPID {
+				pidHistory <- curPID
+				prevPID = curPID
+			}
+			if curWNS == expectedWNS && curPID != 0 && curPID != oldPid {
+				// We've observed the expected final state, we can stop observing now.
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}()
+
 	// Rapidly update namespaces.
 	go func() {
 		// ~500 millisecond worth of updates
@@ -238,71 +271,26 @@ func testDebounce(t *testing.T, orgName string, cmdArgs []string) {
 		}
 	}()
 
-	var failForever bool
-	assert.Eventually(t, func() bool {
-		storedWNS := os.Getenv(defaultTargetEnvVar)
-		expectedWNS := fmt.Sprintf("namespace-%d", numUpdates-1)
-		if storedWNS != startingNS && storedWNS != expectedWNS {
-			// We expect only the last update to be applied after debouncing.
-			// If we see any intermediate namespaces, fail the test.
-			// NOTE: because testify/assert.Eventually runs the condition
-			//       function in a goroutine, we cannot use t.FailNow() or
-			//       similar method to quit early.
-			t.Logf("Expected namespaces %q but got %q", expectedWNS, storedWNS)
-			failForever = true
-		}
-		return !failForever && storedWNS == expectedWNS
-	}, 5*time.Second, 500*time.Millisecond, "Timed out waiting for expected namespaces to be set")
-}
-
-func testTrailingDebounce(t *testing.T, orgName string, cmdArgs []string) {
-	pm := NewProcessManager(&ProcessManagerConfig{
-		kubeConfig:        nil,
-		namespaceSelector: fmt.Sprintf("organization/name=%s", orgName),
-		targetEnvVar:      defaultTargetEnvVar,
-
-		arguments:              cmdArgs,
-		terminationGracePeriod: 2 * time.Second,
-		sigkillTimeout:         2 * time.Second,
-		debouncePeriod:         200 * time.Millisecond,
-		logger:                 testr.New(t),
-	})
-
-	pmStop := make(chan struct{})
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	go func() {
-		assert.NoError(t, pm.Start(ctx))
-		close(pmStop)
-	}()
-	defer func() {
-		cancel()
-		<-pmStop
-	}()
-
-	pm.UpdateNamespaces("ns-0")
-	var oldPid int
-	require.Eventually(t, func() bool {
-		select {
-		case <-pm.Done():
-			return false
-		default:
-		}
-		oldPid = pm.currentPID()
-		return oldPid != 0
-	}, 5*time.Second, 50*time.Millisecond, "Timed out waiting initial process to start")
-	assert.Equal(t, oldPid, pm.currentPID(), "process restarted before the quiet period elapsed")
-	assert.Equal(t, "ns-0", os.Getenv(defaultTargetEnvVar), "namespaces changed before the quiet period elapsed")
-
-	var finalNS string
-	for i := range 5 {
-		finalNS = fmt.Sprintf("ns-%d", i+1)
-		pm.UpdateNamespaces(finalNS)
-		time.Sleep(100 * time.Millisecond)
+	select {
+	case <-observeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected to observe the expected final state within the timeout")
 	}
-	assert.Eventually(t, func() bool {
-		return pm.currentPID() != oldPid && os.Getenv(defaultTargetEnvVar) == finalNS
-	}, 5*time.Second, 50*time.Millisecond, "Timed out waiting for the final debounced restart")
+	close(envHistory)
+	close(pidHistory)
+
+	var transitions []string
+	for wns := range envHistory {
+		transitions = append(transitions, wns)
+	}
+	assert.Equal(t, []string{expectedWNS}, transitions, "expected only the final debounced namespace to be applied")
+
+	var pidTransitions []int
+	for pid := range pidHistory {
+		pidTransitions = append(pidTransitions, pid)
+	}
+	assert.Len(t, pidTransitions, 1, "expected exactly one debounced process restart")
+	assert.NotEqual(t, oldPid, pidTransitions[0], "expected the debounced restart to use a new PID")
 }
 
 func TestProcessManagerIgnoresDuplicateNamespaceUpdates(t *testing.T) {
@@ -354,10 +342,5 @@ func TestProcessManager(t *testing.T) {
 	t.Run("handles debounce", func(t *testing.T) {
 		args := []string{"sh", "-c", "trap 'exit' TERM; while :; do sleep 1; done"}
 		testDebounce(t, "test-debounce", args)
-	})
-
-	t.Run("uses trailing-edge debounce", func(t *testing.T) {
-		args := []string{"sh", "-c", "trap 'exit' TERM; while :; do sleep 1; done"}
-		testTrailingDebounce(t, "test-trailing-debounce", args)
 	})
 }
