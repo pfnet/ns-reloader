@@ -221,7 +221,8 @@ func (pm *ProcessManager) Start(ctx context.Context) error {
 				// since the last reload.
 				waitPeriod = max(pm.debouncePeriod-time.Since(lastReload), 0)
 			}
-			debounceTimer.Reset(waitPeriod)
+			# We can ignore the previous timer completely.
+			_ = debounceTimer.Reset(waitPeriod)
 			pm.log.Info("Namespace update received; scheduling restart", "waitPeriod", waitPeriod)
 		}
 	}
