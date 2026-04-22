@@ -119,7 +119,7 @@ func testProcessRestart(t *testing.T, orgName string, cmdArgs []string) {
 	}()
 
 	// Set the initial namespaces to trigger process start.
-	pm.UpdateNamespaces([]string{"initial-namespace"})
+	pm.UpdateNamespaces("initial-namespace")
 
 	// Wait for the initial process to start.
 	var oldPid int
@@ -206,7 +206,7 @@ func testDebounce(t *testing.T, orgName string, cmdArgs []string) {
 
 	// Set the initial namespaces to trigger process start.
 	startingNS := "initial-namespace"
-	pm.UpdateNamespaces([]string{startingNS})
+	pm.UpdateNamespaces(startingNS)
 
 	// Wait for the initial process to start.
 	var oldPid int
@@ -229,30 +229,89 @@ func testDebounce(t *testing.T, orgName string, cmdArgs []string) {
 	t.Log("Initial process started with PID", oldPid)
 
 	numUpdates := 50
+	expectedWNS := fmt.Sprintf("namespace-%d", numUpdates-1)
+	envHistory := make(chan string, numUpdates+1)
+	pidHistory := make(chan int, numUpdates+1)
+	observeDone := make(chan struct{})
+	go func() {
+		defer close(observeDone)
+
+		prevWNS := os.Getenv(defaultTargetEnvVar)
+		prevPID := pm.currentPID()
+		for {
+			curWNS := os.Getenv(defaultTargetEnvVar)
+			curPID := pm.currentPID()
+			if curWNS != prevWNS {
+				envHistory <- curWNS
+				prevWNS = curWNS
+			}
+			if curPID != 0 && curPID != prevPID {
+				pidHistory <- curPID
+				prevPID = curPID
+			}
+			if curWNS == expectedWNS && curPID != 0 && curPID != oldPid {
+				// We've observed the expected final state, we can stop observing now.
+				return
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}()
+
 	// Rapidly update namespaces.
 	go func() {
 		// ~500 millisecond worth of updates
 		for i := range numUpdates {
-			pm.UpdateNamespaces([]string{fmt.Sprintf("namespace-%d", i)})
+			pm.UpdateNamespaces(fmt.Sprintf("namespace-%d", i))
 			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 
-	var failForever bool
-	assert.Eventually(t, func() bool {
-		storedWNS := os.Getenv(defaultTargetEnvVar)
-		expectedWNS := fmt.Sprintf("namespace-%d", numUpdates-1)
-		if storedWNS != startingNS && storedWNS != expectedWNS {
-			// We expect only the last update to be applied after debouncing.
-			// If we see any intermediate namespaces, fail the test.
-			// NOTE: because testify/assert.Eventually runs the condition
-			//       function in a goroutine, we cannot use t.FailNow() or
-			//       similar method to quit early.
-			t.Logf("Expected namespaces %q but got %q", expectedWNS, storedWNS)
-			failForever = true
-		}
-		return !failForever && storedWNS == expectedWNS
-	}, 5*time.Second, 500*time.Millisecond, "Timed out waiting for expected namespaces to be set")
+	select {
+	case <-observeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected to observe the expected final state within the timeout")
+	}
+	close(envHistory)
+	close(pidHistory)
+
+	var transitions []string
+	for wns := range envHistory {
+		transitions = append(transitions, wns)
+	}
+	assert.Equal(t, []string{expectedWNS}, transitions, "expected only the final debounced namespace to be applied")
+
+	var pidTransitions []int
+	for pid := range pidHistory {
+		pidTransitions = append(pidTransitions, pid)
+	}
+	assert.Len(t, pidTransitions, 1, "expected exactly one debounced process restart")
+	assert.NotEqual(t, oldPid, pidTransitions[0], "expected the debounced restart to use a new PID")
+}
+
+func TestProcessManagerIgnoresDuplicateNamespaceUpdates(t *testing.T) {
+	pm := NewProcessManager(&ProcessManagerConfig{
+		targetEnvVar: defaultTargetEnvVar,
+		logger:       testr.New(t),
+	})
+
+	pm.UpdateNamespaces("ns-a")
+	select {
+	case <-pm.updateChan:
+	default:
+		t.Fatal("expected first namespace update to be queued")
+	}
+
+	pm.UpdateNamespaces("ns-a")
+	select {
+	case <-pm.updateChan:
+		t.Fatal("duplicate namespace update should not be queued")
+	default:
+	}
 }
 
 func TestReloader(t *testing.T) {
