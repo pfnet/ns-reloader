@@ -100,6 +100,10 @@ func getEnvDuration(log logr.Logger, key string, defaultVal time.Duration) time.
 	return val
 }
 
+func versionInfo() string {
+	return fmt.Sprintf("ns-reloader version %s (commit %s)", version, commit)
+}
+
 func main() {
 	log := zap.New(zap.UseFlagOptions(&zap.Options{
 		Development: true,
@@ -108,6 +112,12 @@ func main() {
 	})).WithName("reloader")
 
 	flagSet := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	showVersion := flagSet.Bool("version", false, "Print version information and exit")
+	flagSet.Usage = func() {
+		_, _ = fmt.Fprintln(flagSet.Output(), versionInfo())
+		_, _ = fmt.Fprintf(flagSet.Output(), "Usage of %s:\n", flagSet.Name())
+		flagSet.PrintDefaults()
+	}
 	namespaceSelector := flagSet.String(
 		"namespace-selector",
 		getEnvDefault(envKeyWatchNamespaceSelector, ""),
@@ -148,6 +158,10 @@ func main() {
 		log.Error(err, "Failed to parse flags")
 		flagSet.Usage()
 		os.Exit(1)
+	}
+	if *showVersion {
+		fmt.Println(versionInfo())
+		return
 	}
 
 	args := flagSet.Args()
