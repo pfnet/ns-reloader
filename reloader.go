@@ -33,6 +33,7 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -59,10 +60,6 @@ func run(ctx context.Context, controllerName string, cfg *ProcessManagerConfig) 
 	if err != nil {
 		return fmt.Errorf("parse label selector from %s: %w", cfg.namespaceSelector, err)
 	}
-	nsLblPredicate, err := predicate.LabelSelectorPredicate(*nsLbsl)
-	if err != nil {
-		return fmt.Errorf("create namespace label predicate: %w", err)
-	}
 	nsSelector, err := metav1.LabelSelectorAsSelector(nsLbsl)
 	if err != nil {
 		return fmt.Errorf("convert label selector: %w", err)
@@ -70,7 +67,7 @@ func run(ctx context.Context, controllerName string, cfg *ProcessManagerConfig) 
 	if err := builder.ControllerManagedBy(mgr).
 		Named(controllerName).
 		For(&corev1.Namespace{}).
-		WithEventFilter(nsLblPredicate).
+		WithEventFilter(namespaceLabelPredicate(nsSelector)).
 		Complete(&NamespaceWatcher{
 			client:         mgr.GetClient(),
 			nsSelector:     nsSelector,
@@ -80,6 +77,19 @@ func run(ctx context.Context, controllerName string, cfg *ProcessManagerConfig) 
 	}
 
 	return mgr.Start(ctx)
+}
+
+func namespaceLabelPredicate(selector labels.Selector) predicate.Funcs {
+	matches := func(obj client.Object) bool {
+		return obj != nil && selector.Matches(labels.Set(obj.GetLabels()))
+	}
+	p := predicate.NewPredicateFuncs(matches)
+	// A namespace leaving the selection must also trigger reconciliation so
+	// the wrapped process stops watching it.
+	p.UpdateFunc = func(e event.UpdateEvent) bool {
+		return matches(e.ObjectOld) || matches(e.ObjectNew)
+	}
+	return p
 }
 
 // ProcessManagerConfig holds the configuration for [ProcessManager].
